@@ -1,1 +1,164 @@
+name: Video Pro release
 
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: Build id (12 hex characters)
+        required: true
+      app_name:
+        required: true
+        default: Video Pro
+      version_name:
+        required: true
+      version_code:
+        required: true
+      release_notes:
+        required: false
+        default: ''
+      icon_url:
+        description: Signed link to the app icon (optional)
+        required: false
+        default: ''
+      icon_bg:
+        description: Icon background color, like #00897B
+        required: false
+        default: '#00897B'
+      config_json:
+        description: Features, quality and watermark settings as JSON
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Values are passed through env, never pasted into shell commands
+    env:
+      BUILD_ID: ${{ inputs.build_id }}
+      APP_NAME: ${{ inputs.app_name }}
+      VERSION_NAME: ${{ inputs.version_name }}
+      VERSION_CODE: ${{ inputs.version_code }}
+      RELEASE_NOTES: ${{ inputs.release_notes }}
+      ICON_URL: ${{ inputs.icon_url }}
+      ICON_BG: ${{ inputs.icon_bg }}
+      CONFIG_JSON: ${{ inputs.config_json }}
+    steps:
+      - name: Check inputs
+        run: |
+          [[ "$BUILD_ID" =~ ^[0-9a-f]{12}$ ]] || { echo "bad build id"; exit 1; }
+          [[ "$VERSION_CODE" =~ ^[0-9]{1,9}$ ]] || { echo "bad version code"; exit 1; }
+          [[ "$VERSION_NAME" =~ ^[0-9A-Za-z._-]{1,20}$ ]] || { echo "bad version name"; exit 1; }
+          [[ "$ICON_BG" =~ ^#[0-9A-Fa-f]{6}$ ]] || { echo "bad icon color"; exit 1; }
+          [[ -z "$ICON_URL" || "$ICON_URL" == https://* ]] || { echo "bad icon url"; exit 1; }
+          printf '%s' "$APP_NAME" | perl -CS -ne 'exit 1 unless /\A[\p{L}\p{N} .,\-]{2,30}\z/' \
+            || { echo "bad app name"; exit 1; }
+          if [ -z "$CONFIG_JSON" ]; then CONFIG_JSON='{"v":1}'; fi
+          printf '%s' "$CONFIG_JSON" | jq -e '
+            (.v == 1) and
+            ((.features // {}) | type == "object" and all(.[]; type == "boolean")) and
+            (((.quality // 1080) | . == 720 or . == 1080)) and
+            (((.watermark.on // false) | type == "boolean")) and
+            (((.watermark.text // "") | type == "string" and length <= 40))
+          ' >/dev/null || { echo "bad config_json"; exit 1; }
+          # keep only the keys we know, so nothing else can reach the app
+          printf '%s' "$CONFIG_JSON" | jq -c '{v: 1, features: ((.features // {}) | with_entries(select(.key | IN("trim","speed","volume","text","music","filters","rotate","ratio")))), quality: (.quality // 1080), watermark: {on: (.watermark.on // false), text: ((.watermark.text // "") | gsub("[\u0001-\u001f]"; " "))}}' > "$RUNNER_TEMP/config.json"
+          cat "$RUNNER_TEMP/config.json"
+          printf '%s' "$RELEASE_NOTES" | head -c 2000 > "$RUNNER_TEMP/notes.txt"
+
+      - uses: actions/checkout@v4
+
+      - name: Find the project
+        run: |
+          # Either the project sits in the repo, or it comes as ONE zip file in the repo
+          if ls ./*.zip >/dev/null 2>&1; then
+            n=$(ls ./*.zip | wc -l)
+            [ "$n" -eq 1 ] || { echo "ERROR: found $n zip files ($(ls ./*.zip | tr '\n' ' ')). Keep exactly one zip in the repo."; exit 1; }
+            unzip -oq ./*.zip -d extracted
+            P=$(dirname "$(find extracted -name settings.gradle.kts | head -1)")
+          else
+            P=.
+          fi
+          [ -f "$P/settings.gradle.kts" ] || { echo "ERROR: settings.gradle.kts not found. Is the project in the repo?"; exit 1; }
+          echo "PROJECT=$P" >> "$GITHUB_ENV"
+          echo "Project folder: $P"
+
+      - name: Apply settings and icon
+        run: |
+          APP="$PROJECT/app/src/main"
+          mkdir -p "$APP/assets"
+          cp "$RUNNER_TEMP/config.json" "$APP/assets/config.json"
+          sed -i "s|<color name=\"ic_launcher_background\">#[0-9A-Fa-f]*</color>|<color name=\"ic_launcher_background\">$ICON_BG</color>|" "$APP/res/values/ic_launcher_background.xml"
+          if [ -n "$ICON_URL" ]; then
+            sudo apt-get install -y imagemagick >/dev/null
+            curl -fsSL --max-time 60 --max-filesize 3000000 "$ICON_URL" -o icon.src
+            identify "icon.src[0]" >/dev/null
+            rm -f "$APP/res/drawable/ic_launcher_foreground.xml"
+            mkdir -p "$APP/res/drawable-xxxhdpi"
+            convert "icon.src[0]" -background none -resize 260x260 -gravity center -extent 432x432 "PNG32:$APP/res/drawable-xxxhdpi/ic_launcher_foreground.png"
+            echo "Icon replaced"
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.11.1
+
+      - name: Check signing key
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          K_ALIAS: ${{ secrets.KEY_ALIAS }}
+          K_PASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          KS_PASS=$(printf '%s' "$KS_PASS" | tr -d ' \r\n\t')
+          K_ALIAS=$(printf '%s' "$K_ALIAS" | tr -d ' \r\n\t')
+          K_PASS=$(printf '%s' "$K_PASS" | tr -d ' \r\n\t')
+          [ -n "$KS_B64" ] || { echo "ERROR: secret KEYSTORE_BASE64 is empty or missing."; exit 1; }
+          [ -n "$KS_PASS" ] || { echo "ERROR: secret KEYSTORE_PASSWORD is empty or missing."; exit 1; }
+          printf '%s' "$KS_B64" | tr -d ' \r\n\t' | base64 -d > "$RUNNER_TEMP/release.jks" 2>/dev/null \
+            || { echo "ERROR: KEYSTORE_BASE64 is not valid. Paste the WHOLE content again."; exit 1; }
+          keytool -list -keystore "$RUNNER_TEMP/release.jks" -storepass "$KS_PASS" >/dev/null 2>&1 \
+            || { echo "ERROR: KEYSTORE_PASSWORD does not match KEYSTORE_BASE64."; exit 1; }
+          keytool -list -keystore "$RUNNER_TEMP/release.jks" -storepass "$KS_PASS" -alias "$K_ALIAS" >/dev/null 2>&1 \
+            || { echo "ERROR: KEY_ALIAS is wrong."; exit 1; }
+          echo "Signing key OK"
+          {
+            echo "KEYSTORE_PATH=$RUNNER_TEMP/release.jks"
+            echo "KEYSTORE_PASSWORD=$KS_PASS"
+            echo "KEY_ALIAS=$K_ALIAS"
+            echo "KEY_PASSWORD=$K_PASS"
+          } >> "$GITHUB_ENV"
+
+      - name: Build signed APK and Play bundle (AAB)
+        working-directory: ${{ env.PROJECT }}
+        run: |
+          set -o pipefail
+          gradle assembleRelease bundleRelease --no-daemon --console=plain 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Show build errors
+        if: failure()
+        run: |
+          echo "===== BUILD ERRORS (copy from here) ====="
+          grep -n -E "^e: |What went wrong|Execution failed|Caused by|Could not|Unresolved|Manifest merger|error:" -A4 "$RUNNER_TEMP/build.log" | head -90 || true
+
+      - name: Name the files
+        run: |
+          cp "$PROJECT/app/build/outputs/apk/release/app-release.apk" "$BUILD_ID.apk"
+          cp "$PROJECT/app/build/outputs/bundle/release/app-release.aab" "$BUILD_ID.aab"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: vp-${{ inputs.build_id }}
+          name: Video Pro ${{ inputs.version_name }}
+          body_path: ${{ runner.temp }}/notes.txt
+          make_latest: false
+          files: |
+            ${{ inputs.build_id }}.apk
+            ${{ inputs.build_id }}.aab
